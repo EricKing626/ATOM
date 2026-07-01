@@ -1,5 +1,10 @@
 name: Atomesh Benchmark
 
+env:
+  ATOMESH_SMOKE_NODES: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-1,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-2
+  ATOMESH_NIGHTLY_1P1D_NODES: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-3,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-4
+  ATOMESH_NIGHTLY_2P1D_NODES: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7
+
 on:
   push:
     branches: [main, zwan/mesh-model-ci]
@@ -143,6 +148,7 @@ jobs:
     timeout-minutes: 420
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:
       - name: Checkout ATOM repo
@@ -154,7 +160,20 @@ jobs:
           RESULT_DIR: atomesh-results
         run: |
           set -euo pipefail
+          ORIGINAL_WORKSPACE="${GITHUB_WORKSPACE}"
+          SHARED_WORKSPACE="/data/$(id -un)/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
+          rm -rf "${SHARED_WORKSPACE}"
+          mkdir -p "${SHARED_WORKSPACE}"
+
+          if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "${ORIGINAL_WORKSPACE}/" "${SHARED_WORKSPACE}/"
+          else
+            tar -C "${ORIGINAL_WORKSPACE}" -cf - . | tar -C "${SHARED_WORKSPACE}" -xf -
+          fi
+
+          cd "${SHARED_WORKSPACE}"
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          RESULT_DIR="${ORIGINAL_WORKSPACE}/${RESULT_DIR}"
           bash .github/scripts/atomesh/pd_submit.sh \
             --cell-json "$CELL_JSON" \
             --result-dir "$RESULT_DIR"

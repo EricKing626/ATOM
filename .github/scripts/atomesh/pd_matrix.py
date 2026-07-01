@@ -33,6 +33,24 @@ def normalize_list(value: Any) -> list[Any]:
     return [value]
 
 
+def normalize_nodes(value: Any, *, suite_name: str) -> list[str]:
+    nodes: list[str] = []
+    for item in normalize_list(value):
+        raw = str(item)
+        match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", raw)
+        if match:
+            env_name = match.group(1)
+            raw = os.environ.get(env_name, "")
+            if not raw:
+                raise ValueError(
+                    f"{suite_name} references {env_name} for nodes, but it is not set"
+                )
+
+        nodes.extend(node.strip() for node in raw.split(",") if node.strip())
+
+    return nodes
+
+
 def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-").lower()
 
@@ -104,11 +122,10 @@ def build_cell(
             f"Only atom backend is currently supported, got {backend_name}"
         )
 
-    nodes = [str(node) for node in normalize_list(suite_cfg.get("nodes"))]
+    suite_display_name = str(suite_cfg.get("name", model_name))
+    nodes = normalize_nodes(suite_cfg.get("nodes"), suite_name=suite_display_name)
     if len(nodes) < 2:
-        raise ValueError(
-            f"{suite_cfg.get('name', model_name)} needs at least two nodes"
-        )
+        raise ValueError(f"{suite_display_name} needs at least two nodes")
 
     prefill_cfg = deep_merge(
         backend_cfg.get("service", {}).get("prefill", {}),

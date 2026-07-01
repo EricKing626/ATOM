@@ -1,12 +1,14 @@
 defaults:
   runner:
-    slurm_account: amd-frameworks
-    slurm_partition: amd-frameworks
-    slurm_submit_runner: atomesh-cicd
-    gpus_per_node: 8
-    cpus_per_task: 114
+    slurm_account: ""
+    slurm_partition: ""
+    slurm_submit_runner: atomesh-cicd-mi350
+    gpus_per_node: ""
+    cpus_per_task: ""
     time_limit: "06:00:00"
-    log_root: /it-share/ATOMESH_LOG/
+    spur_controller_addr: http://134.199.196.72:6817
+    spur_accounting_addr: http://134.199.196.72:6819
+    log_root: /data/${USER}/logs/ATOMESH_LOG/
   benchmark:
     random_range_ratio: 0.8
     request_rate: inf
@@ -45,7 +47,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: /mnt/models/DeepSeek-V4-Pro/
+    model_path: /data/models2/DeepSeek-V4-Pro/
     precision: FP4
     env:
       common:
@@ -67,7 +69,7 @@ models:
       smoke:
         - name: ds-v4-1p1d-tp8-smoke
           topology: 1p1d
-          nodes: [mia1-p02-g42, mia1-p02-g44]
+          nodes: ${ATOMESH_SMOKE_NODES}
           isl: [8192]
           osl: 1024
           concurrency: [4, 8]
@@ -77,7 +79,7 @@ models:
       nightly:
         - name: ds-v4-1p1d-tp8
           topology: 1p1d
-          nodes: [mia1-p02-g42, mia1-p02-g47]
+          nodes: ${ATOMESH_NIGHTLY_1P1D_NODES}
           isl: [8192]
           osl: 1024
           concurrency: [64, 128]
@@ -85,7 +87,7 @@ models:
 
         - name: ds-v4-2p1d-dpa-tp8
           topology: 2p1d_dpa
-          nodes: [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47]
+          nodes: ${ATOMESH_NIGHTLY_2P1D_NODES}
           isl: [8192]
           osl: 1024
           concurrency: [256, 512]

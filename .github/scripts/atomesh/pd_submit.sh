@@ -123,12 +123,20 @@ exports = {
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
     "EVAL_FEWSHOT": accuracy.get("fewshot", 3),
     "EVAL_LIMIT": "" if accuracy.get("limit") is None else accuracy.get("limit"),
-    "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
-    "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
-    "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
+    "SLURM_ACCOUNT": runner.get("slurm_account", ""),
+    "SLURM_PARTITION": runner.get("slurm_partition", ""),
+    "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", ""),
+    "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", ""),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
-    "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
+    "SLURM_LOG_ROOT": runner.get("log_root", "/data/${USER}/logs/ATOMESH_LOG/"),
+    "SPUR_CONTROLLER_ADDR": runner.get(
+        "spur_controller_addr",
+        os.environ.get("SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"),
+    ),
+    "SPUR_ACCOUNTING_ADDR": runner.get(
+        "spur_accounting_addr",
+        os.environ.get("SPUR_ACCOUNTING_ADDR", "http://134.199.196.72:6819"),
+    ),
 }
 
 for key, value in exports.items():
@@ -144,9 +152,12 @@ PY
 )"
 
 export RESULT_DIR
+CURRENT_USER="$(id -un)"
+SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
+SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
-export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
-export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
+export SLURM_OUTPUT="/tmp/spur-%j.out"
+export SLURM_ERROR="/tmp/spur-%j.err"
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 
 echo "=== ATOMesh benchmark cell ==="
@@ -156,6 +167,8 @@ echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "log_root=${LOG_ROOT}"
+echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
+echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 
 mkdir -p "${RESULT_DIR}"
 
@@ -284,7 +297,7 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+  sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
   if [[ -z "${sacct_line}" ]]; then
     return 0
   fi
@@ -302,44 +315,52 @@ read_slurm_exit_code() {
     SLURM_JOB_RC="${exit_status}"
   fi
 
-  if [[ "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
+  if [[ "${SLURM_STATE}" != COMPLETE && "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
     SLURM_JOB_RC=1
   fi
 }
 
-IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
-SBATCH_CMD=(
-  sbatch
-  --parsable
-  --exclusive
-  --account "${SLURM_ACCOUNT}"
-  --partition "${SLURM_PARTITION}"
-  --nodes "${NUM_NODES}"
-  --ntasks "${NUM_NODES}"
-  --ntasks-per-node 1
-  --cpus-per-task "${SLURM_CPUS_PER_TASK}"
-  --gres "gpu:${SLURM_GPUS_PER_NODE}"
-  --time "${SLURM_TIME_LIMIT}"
-  --nodelist "${NODE_LIST}"
-  --output "${SLURM_OUTPUT}"
-  --error "${SLURM_ERROR}"
-  "${JOB_SCRIPT}"
-)
+SUBMIT_SCRIPT="${LOG_ROOT}/submit-${ATOMESH_CELL_ID}.sbatch.sh"
+cat > "${SUBMIT_SCRIPT}" <<EOF
+#!/bin/bash
+#SBATCH --job-name=${ATOMESH_CELL_ID}
+#SBATCH --nodes=${NUM_NODES}
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=${SLURM_TIME_LIMIT}
+#SBATCH --chdir=/tmp
+#SBATCH --nodelist=${NODE_LIST}
+#SBATCH --output=${SLURM_OUTPUT}
+#SBATCH --error=${SLURM_ERROR}
+
+set -euo pipefail
+bash "${JOB_SCRIPT}"
+EOF
+chmod +x "${SUBMIT_SCRIPT}"
+
+SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" "${SUBMIT_SCRIPT}")
 
 echo "=== submitting Slurm job ==="
 printf ' %q' "${SBATCH_CMD[@]}"
 echo
 
 set +e
-JOB_ID="$("${SBATCH_CMD[@]}")"
+SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
 SBATCH_RC=$?
 set -e
-JOB_ID="${JOB_ID%%;*}"
+printf '%s\n' "${SBATCH_OUTPUT}"
+JOB_ID="$(printf '%s\n' "${SBATCH_OUTPUT}" | awk '
+  /^[0-9]+(;.*)?$/ { sub(/;.*/, "", $1); print $1; exit }
+  /Submitted batch job [0-9]+/ { print $NF; exit }
+')"
 echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
 
 if [[ "${SBATCH_RC}" -ne 0 ]]; then
   echo "sbatch submit exit code: ${SBATCH_RC}"
   exit "${SBATCH_RC}"
+fi
+if [[ -z "${JOB_ID}" ]]; then
+  echo "ERROR: unable to parse Slurm job id from sbatch output" >&2
+  exit 1
 fi
 
 SLURM_JOB_ACTIVE=1
@@ -354,7 +375,17 @@ echo "slurm job exit code: ${SBATCH_RC}"
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"
-  cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true
+  tar \
+    --exclude='.cache' \
+    --exclude='./.cache' \
+    --exclude='.aiter' \
+    --exclude='./.aiter' \
+    -C "${LOG_ROOT}" \
+    -cf - . | tar \
+      --no-same-owner \
+      --no-same-permissions \
+      -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" \
+      -xf - || true
 fi
 
 exit "${SBATCH_RC}"
