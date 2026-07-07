@@ -205,5 +205,6 @@ python -m atom.entrypoints.openai_server \
   --no-enable_prefix_caching \
   --num-speculative-tokens 3 \
   --method mtp \
+  --online_quant_config '{"layer_quant_config": {"*layers.78*": "ptpc_fp8"}, "exclude_layer": ["*.gate", "*shared_head*", "*embed*"]}' \
   -tp $TP 2>&1 | tee server_mtp.log
 ```
