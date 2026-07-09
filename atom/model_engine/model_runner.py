@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import bisect
 import gc
 import logging
 import math
@@ -21,7 +22,8 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
-from atom.config import Config, set_current_atom_config
+from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.utils.cuda_graph import BatchDescriptor
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -1461,6 +1463,68 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         activation_bytes = max(peak - current, 0)
+
+        # PIECEWISE: the pool holds each dense piece captured at every distinct
+        # num_tokens shape (num_tokens = bs*q; capture is memory-guarded, below).
+        # Memory ~ per_token * Σ(distinct captured num_tokens). Estimate from the
+        # shapes (not the FULL Σq formula, which under-reserves here -> OOM).
+        if self._piecewise_cg_active():
+            from atom.utils import envs as _envs
+
+            cap_sizes = self.config.compilation_config.cudagraph_capture_sizes or [
+                self.config.max_num_seqs
+            ]
+            if hasattr(self, "drafter") and getattr(
+                self.drafter, "dspark_confidence_schedule", False
+            ):
+                from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+
+                full_q = self.drafter.mtp_k + 1
+                _sizes_spec = (
+                    _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
+                    if _envs.ATOM_DSPARK_RAGGED
+                    else _envs.ATOM_DSPARK_Q_BUCKETS
+                )
+                q_buckets = resolve_q_buckets(_sizes_spec, full_q)
+                if os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1":
+                    q_buckets = sorted(set(q_buckets) | set(range(1, full_q + 1)))
+            else:
+                q_buckets = [1]
+            hidden = int(self.config.hf_config.hidden_size)
+            # Per-token retained cudagraph-pool cost. Calibrated to the MEASURED
+            # per_token_actual on DSV4 TP8 PIECEWISE after the weak_ref_tensor fix
+            # (atom/utils weak-ref op) let the shared pool OVERLAY captured piece
+            # outputs across shapes: actual_pool=10.14GB / Σtok=4472 = 2.322MB/tok
+            # (was 8.5MB/tok when weak_ref silently fell back to a strong ref and
+            # every piece output was retained -> no overlay -> 35GB pool). 2.5MB
+            # keeps a small margin above the measured 2.322MB. NOTE: the
+            # sum-of-distinct model below now OVER-estimates (overlay makes the
+            # true pool ~max-bucket-driven, not a sum), so this is a safe upper
+            # bound on the KV reservation. Under-reserving never OOMs: the
+            # capture-time guard re-checks live free memory per bucket and skips
+            # any that would not fit.
+            per_token_gb = 0.0025 * (hidden / 7168.0)
+            total_gpu = torch.cuda.mem_get_info()[1]
+            target_reserve = 0.12 * total_gpu
+            _all = sorted({bs * q for bs in cap_sizes for q in q_buckets})
+            distinct = []
+            _acc = 0
+            for _nt in _all:
+                if (
+                    distinct
+                    and 1.2 * per_token_gb * (1 << 30) * (_acc + _nt) > target_reserve
+                ):
+                    break
+                distinct.append(_nt)
+                _acc += _nt
+            overhead = 1.2 * per_token_gb * (1 << 30) * sum(distinct)
+            logger.info(
+                "PIECEWISE cudagraph mem estimate: n_shapes=%d/%d Σtok=%d "
+                "hidden=%d target=%.1fGB -> overhead=%.2fGB",
+                len(distinct), len(_all), sum(distinct), hidden,
+                target_reserve / (1 << 30), overhead / (1 << 30),
+            )
+            return int(overhead)
         # CUDA graph pool overhead is roughly 20% of single-pass activation
         # memory due to pooling across captured batch sizes. Measured on MI355
         # V4-Pro TP8 (CG-PROBE): a single q-bucket graph set across all bs adds
@@ -1486,11 +1550,20 @@ class ModelRunner:
             )
             buckets = resolve_q_buckets(_sizes_spec, full_q)
             n_buckets = len(buckets)
-            overhead = activation_bytes * 0.2 * n_buckets
+            sum_q = sum(buckets)
+            # Estimate the graph pool from the graph SHAPES (TP/DP-invariant; do
+            # NOT scale by the warmup activation, which differs ~2x TP vs DP for
+            # the SAME graphs -> 70GB vs 150GB, negative KV under DP). Each
+            # q-bucket's pool ~ its largest captured graph (max_bs * q); sum over
+            # buckets -> ~per_q * Σq. per_q calibrated to a DSV4 8-bucket ~65GB.
+            hidden = int(self.config.hf_config.hidden_size)
+            max_bs = int(self.config.max_num_seqs)
+            per_q = 1.4 * (1 << 30) * (max_bs / 512.0) * (hidden / 7168.0)
+            overhead = 1.3 * per_q * sum_q
             logger.info(
-                "DSpark cudagraph mem estimate: buckets=%s n=%d act=%.2fGB "
-                "-> overhead=%.2fGB",
-                buckets, n_buckets, activation_bytes / (1 << 30),
+                "DSpark cudagraph mem estimate: buckets=%s n=%d Σq=%d "
+                "max_bs=%d hidden=%d -> overhead=%.2fGB",
+                buckets, n_buckets, sum_q, max_bs, hidden,
                 overhead / (1 << 30),
             )
         return int(overhead)
@@ -2262,7 +2335,14 @@ class ModelRunner:
         """
         if self.config.parallel_config.data_parallel_size <= 1:
             return
-        if not hasattr(self, "drafter"):
+        # Only DSpark's DYNAMIC verify length makes (bs, q) diverge across ranks.
+        # Plain MTP has a fixed q (= mtp_k+1) already uniform on every rank, so
+        # the sync is unnecessary there — skip it to avoid an extra per-step
+        # all_reduce that would slow MTP decode.
+        if not (
+            hasattr(self, "drafter")
+            and getattr(self.drafter, "dspark_confidence_schedule", False)
+        ):
             return
         import torch.distributed as dist
 
@@ -2579,9 +2659,105 @@ class ModelRunner:
             with record_function(label):
                 graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
+                num_tokens = context.batch_size * max_q_len  # real (output slice)
+
+                if self._piecewise_cg_active():
+                    # PIECEWISE replay: no whole-forward graph. Dense pieces are
+                    # per-token, so (TP only) we replay at a 1D num_tokens bucket
+                    # sized to the REAL ragged token count Σ (= total_tokens_num_
+                    # decode) instead of the rectangular C = bs*q_eff -> MoE/linear
+                    # shrink with Σ (DSpark dynamic). Attention is eager on the
+                    # flat [0:Σ] tokens; the [Σ:pad] tail is masked (batch_id -1).
+                    #
+                    # DP is EXCLUDED: per-rank Σ diverges -> different buckets ->
+                    # the fixed-size MoE all_gather deadlocks/accumulates. DP uses
+                    # the rectangular bucket (and should run FULL for decode).
+                    _one_d = (
+                        os.environ.get("ATOM_PIECEWISE_1D_RAGGED", "1") == "1"
+                        and batch is not None
+                        and getattr(self, "_piecewise_sorted_tokens", None)
+                        and self.config.parallel_config.data_parallel_size <= 1
+                    )
+                    _is_dummy = batch is not None and batch.is_dummy_run
+                    if _one_d and not _is_dummy:
+                        # TP-only (guarded above): all ranks share the same batch
+                        # -> same Σ -> num_tokens_pad naturally identical, so NO
+                        # cross-rank sync is needed. (A per-step gloo all_reduce
+                        # here deadlocked the async GPU pipeline -> removed.)
+                        real_tokens = int(batch.total_tokens_num_decode)
+                        _bk = self._piecewise_sorted_tokens
+                        _i = bisect.bisect_left(_bk, real_tokens)
+                        if _i < len(_bk):
+                            num_tokens_pad = _bk[_i]
+                            _captured = True
+                        else:
+                            # Σ exceeds the largest captured bucket -> eager.
+                            num_tokens_pad = max(real_tokens, graph_bs * max_q_len)
+                            _captured = False
+                        # Pad tail to a LEGAL vocab id / position (the builder
+                        # fills to graph_cap >= num_tokens_pad, so this is a no-op
+                        # safety net; matches the working baseline).
+                        if num_tokens_pad > real_tokens:
+                            self.forward_vars["input_ids"].gpu[
+                                real_tokens:num_tokens_pad
+                            ].zero_()
+                            self.forward_vars["positions"].gpu[
+                                real_tokens:num_tokens_pad
+                            ].zero_()
+                    else:
+                        num_tokens_pad = graph_bs * max_q_len
+                        _captured = num_tokens_pad in getattr(
+                            self, "_piecewise_captured_tokens", ()
+                        )
+                    _pos = (
+                        self._mrope_positions_view(num_tokens_pad)
+                        if self.use_mrope
+                        else self.forward_vars["positions"].gpu[:num_tokens_pad]
+                    )
+                    forward_context.cudagraph_runtime_mode = (
+                        CUDAGraphMode.PIECEWISE
+                        if (not _is_dummy and _captured)
+                        else CUDAGraphMode.NONE
+                    )
+                    forward_context.batch_descriptor = BatchDescriptor(
+                        num_tokens=num_tokens_pad
+                    )
+                    model_output = self.model(
+                        self.forward_vars["input_ids"].gpu[:num_tokens_pad], _pos
+                    )
+                    forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                    forward_context.batch_descriptor = None
+                    if self.use_aux_hidden_state_outputs:
+                        hidden_states, self._aux_hidden_states = model_output
+                    else:
+                        hidden_states = model_output
+                        self._aux_hidden_states = None
+                    self._collect_dspark_aux(num_tokens_pad)
+                    # Slice off the pad tail before sampling. The forward ran on
+                    # the padded [0:num_tokens_pad] window (so the captured piece
+                    # shapes match), but rows [real:num_tokens_pad] are pad garbage
+                    # and must not reach the sampler.
+                    #
+                    # non-spec: the real length is num_tokens = scheduled_bs *
+                    # max_q_len (max_q_len == 1), identical to the length the
+                    # non-PIECEWISE path uses at forward_vars["outputs"][:
+                    # num_tokens]. Previously this sliced to num_tokens_pad, so
+                    # pad rows leaked into sampled_token_ids (len = pad, e.g. 256)
+                    # -> became prev_token_ids -> next step's prepare_input_ids
+                    # assigned it into a deferred-sized slot (e.g. 253) -> crash.
+                    #
+                    # spec (DSpark): keep the padded slice UNCHANGED — the ragged
+                    # postprocess/draft indices reference the flat [0:Σ] layout
+                    # with Σ <= num_tokens_pad and re-gather to bs via
+                    # next_token_locs, so the tail rows are masked downstream.
+                    _is_spec = hasattr(self, "drafter")
+                    _slice_len = num_tokens_pad if _is_spec else num_tokens
+                    hidden_states = hidden_states[:_slice_len]
+                    logits = self.model.compute_logits(hidden_states)
+                    return logits, hidden_states
+
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
-                num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 if graph_key in self.graph_aux_hidden:
                     self._aux_hidden_states = [
@@ -2901,7 +3077,25 @@ class ModelRunner:
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()
+    def _piecewise_cg_active(self) -> bool:
+        """True when the compiled model's dense pieces self-capture PIECEWISE
+        cudagraphs (attention eager between them). In that mode the runner does
+        NOT build the manual FULL whole-forward graphs — decode calls the model
+        directly and the per-piece CUDAGraphWrapper handles capture/replay."""
+        if self.enforce_eager:
+            return False
+        # Driven by --cudagraph-mode (default FULL -> manual capture, unchanged).
+        # PIECEWISE / FULL_AND_PIECEWISE -> per-piece cudagraph path.
+        mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
+        return mode is not None and mode.requires_piecewise_compilation()
+
     def capture_cudagraph(self):
+        _piecewise = self._piecewise_cg_active()
+        if _piecewise:
+            logger.info(
+                "PIECEWISE cudagraph: capturing per-piece graphs (attention "
+                "eager); manual FULL whole-forward capture disabled."
+            )
         start_time = time.time()
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
@@ -2936,6 +3130,12 @@ class ModelRunner:
             f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
             f"--max-num-seqs."
         )
+
+        # PIECEWISE: the set of num_tokens shapes whose dense pieces we captured.
+        # run_model dispatches by num_tokens; a shape NOT in here would force a
+        # runtime (uncoordinated) capture that hangs on collectives, so run_model
+        # falls back to eager for uncaptured shapes.
+        self._piecewise_captured_tokens: set[int] = set()
 
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
@@ -2991,6 +3191,21 @@ class ModelRunner:
                 )
                 logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
 
+        # PIECEWISE 1D-ragged: pieces are per-token. We do NOT expand q here (that
+        # would capture ~len(graph_bs)*full_q num_tokens buckets -> pool OOM).
+        # Instead the natural {graph_bs * q_eff} products already form a coarse
+        # ~geometric num_tokens grid; run_model replays at round_up_1d(Σ) over
+        # whatever buckets we capture. Set ATOM_PIECEWISE_FINE_TOKENS=1 to also
+        # capture q=1..full_q for a tighter (but far heavier) grid.
+        if (
+            _piecewise
+            and os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1"
+            and full_q_len > 1
+        ):
+            q_buckets = sorted(set(q_buckets) | set(range(1, full_q_len + 1)))
+            logger.info("PIECEWISE FINE piece num_tokens grid: q=%s", q_buckets)
+
+        _rsv_before_capture = torch.cuda.memory_reserved()
         with pause_gc(), graph_capture() as capture_ctx:
           for max_q_len in q_buckets:
             if self.rank == 0:
@@ -3001,6 +3216,11 @@ class ModelRunner:
                     max_q_len, _free / 1e9, _total / 1e9,
                     torch.cuda.memory_reserved() / 1e9,
                 )
+            # Capture LARGEST bs first (graph_bs is sorted descending) — same order
+            # as the known-good build and vLLM (large shapes first). The memory
+            # guard below uses a conservative per-token fallback so it can skip
+            # oversized buckets on the very first (largest) visit without needing a
+            # prior measurement; measurements only tighten logging.
             capture_range = (
                 tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
             )
@@ -3020,6 +3240,41 @@ class ModelRunner:
                 self.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
 
                 num_tokens = bs * max_q_len
+                if _piecewise:
+                    # Memory-guarded cap (replaces the ATOM_PIECEWISE_MAX_TOKENS
+                    # env): skip a bucket whose estimated capture footprint would
+                    # not fit in free GPU memory. Adapts to GPU size / config
+                    # without a hardcoded token cap. Free floored to GB so
+                    # symmetric-TP ranks skip the same set (DP needs a cross-rank
+                    # min-reduce — TODO).
+                    #
+                    # The per-token footprint here is the CAPTURE-TIME cost = the
+                    # transient forward peak (MoE/expert intermediates + attention/
+                    # indexer buffers, released after capture) PLUS the retained
+                    # pool growth. The old 10MB/token was calibrated when the
+                    # weak_ref_tensor fallback silently used a STRONG ref, so every
+                    # piece output was retained (no pool overlay) and the retained
+                    # part alone was ~8.5MB/token. After the weak-ref fix the pool
+                    # overlays (measured retained 2.3MB/token, total pool 10GB for
+                    # Σtok=4472), so the real capture footprint is dominated by the
+                    # transient forward, ~4MB/token here. This lets bs*q buckets up
+                    # to num_tokens=4096 (bs512×q8) fit at capture-time free≈56GB
+                    # instead of being skipped. Still conservative: guard re-checks
+                    # LIVE free each bucket, so if a bucket truly doesn't fit it is
+                    # skipped rather than OOMing.
+                    _slope = 0.004 * (1 << 30) * (
+                        self.config.hf_config.hidden_size / 7168.0
+                    )
+                    _free = torch.cuda.mem_get_info()[0]
+                    _need = _slope * num_tokens * 1.25 + (4 << 30)
+                    if (_free >> 30) < (int(_need) >> 30):
+                        if self.rank == 0:
+                            logger.info(
+                                "PIECEWISE skip num_tokens=%d: free=%.1fGB "
+                                "< need=%.1fGB",
+                                num_tokens, _free / 1e9, _need / 1e9,
+                            )
+                        continue
                 # Use a simple, safe position pattern for capture.
                 self.forward_vars["positions"].np[:num_tokens] = (
                     np.arange(num_tokens, dtype=np.int64) % max_q_len
@@ -3082,6 +3337,23 @@ class ModelRunner:
                     outputs[:num_tokens] = model_output
                 if self.logits_in_graph:
                     self.model.compute_logits(outputs[:num_tokens])
+
+                if _piecewise:
+                    # (Bucket already memory-guarded above; capture unconditionally.)
+                    # PIECEWISE capture: warmup above already ran eager (autotune).
+                    # Flip to PIECEWISE + this num_tokens descriptor and call the
+                    # model; each dense piece's CUDAGraphWrapper captures its own
+                    # cudagraph (inside the shared graph_capture() ctx so
+                    # cross-rank collectives capture in lockstep). No manual
+                    # whole-forward graph.
+                    fc = get_forward_context()
+                    fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+                    fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+                    self.model(input_ids[:num_tokens], model_positions)
+                    fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                    fc.batch_descriptor = None
+                    self._piecewise_captured_tokens.add(num_tokens)
+                    continue
 
                 # Capture
                 with (
@@ -3149,6 +3421,36 @@ class ModelRunner:
                         torch.cuda.memory_allocated() / (1 << 30),
                     )
         self.graph_bs.sort(reverse=False)
+
+        # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
+        # dispatch (bisect_left over this to pick the tightest captured shape).
+        self._piecewise_sorted_tokens = sorted(self._piecewise_captured_tokens)
+        if _piecewise and self.rank == 0:
+            # ACTUAL cudagraph pool memory (reserved delta) vs the estimate, so we
+            # can validate/re-calibrate _estimate_cudagraph_overhead's per_token
+            # (esp. for DP, where the est must grow). Σtok = sum of captured
+            # num_tokens; per_token_actual = pool / Σtok.
+            _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)
+            _sumtok = sum(self._piecewise_sorted_tokens) or 1
+            import atom.utils.cuda_graph as _cg_mod
+            logger.info(
+                "PIECEWISE POOL-DIAG global_env=%s shared_pool=%s n_bucket_pools=%d "
+                "bucket_pool_keys=%s",
+                os.environ.get("ATOM_GLOBAL_POOL"),
+                _cg_mod._shared_graph_pool is not None,
+                len(_cg_mod._graph_pools),
+                sorted(_cg_mod._graph_pools.keys()),
+            )
+            logger.info(
+                "PIECEWISE captured %d num_tokens buckets: %s | actual_pool="
+                "%.2fGB est=%.2fGB per_token_actual=%.3fMB Σtok=%d",
+                len(self._piecewise_sorted_tokens),
+                self._piecewise_sorted_tokens,
+                _pool_bytes / (1 << 30),
+                self._estimate_cudagraph_overhead() / (1 << 30),
+                _pool_bytes / _sumtok / (1 << 20),
+                _sumtok,
+            )
 
         # DSpark Phase 2: calibrate the SPS(B) throughput profile from the just-
         # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
