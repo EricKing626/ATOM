@@ -363,8 +363,18 @@ async def handle_request():
             req_data["kv_transfer_params"]["remote_engine_id"] = prefill_kv[
                 "remote_engine_id"
             ]
+
+        # Forward the prefill block table (all PP stages share it) and the
+        # pipeline width so the decode side can reach every producer stage.
+        # Push mode needs the block table too for downstream PP stages, which
+        # have no scheduler-cached prefill data to look up.
+        if "remote_block_ids" in prefill_kv:
             req_data["kv_transfer_params"]["remote_block_ids"] = prefill_kv[
                 "remote_block_ids"
+            ]
+        if "remote_pp_size" in prefill_kv:
+            req_data["kv_transfer_params"]["remote_pp_size"] = prefill_kv[
+                "remote_pp_size"
             ]
 
         req_data["kv_transfer_params"]["remote_dp_size"] = prefill_ep["dp_size"]

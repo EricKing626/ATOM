@@ -106,6 +106,7 @@ class ReqMeta:
     tp_size: int
     remote_dp_size: int
     remote_dp_rank: int = 0
+    remote_pp_size: int = 1
     transfer_id: int = 0
     local_slot_index: int = -1
 
@@ -162,6 +163,7 @@ class ConnectorMetadata:
             remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
             tp_size=(
                 kv_transfer_params.get("tp_size")
                 if "tp_size" in kv_transfer_params
