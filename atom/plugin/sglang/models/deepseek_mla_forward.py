@@ -263,7 +263,10 @@ def init_sgl_attrs(
     kv_cache_dtype: str = "bf16",
 ) -> None:
     """Initialise sglang-only attributes on DeepseekV2MLAAttention."""
-    from sglang.srt.configs.model_config import is_deepseek_nsa
+    try:
+        from sglang.srt.configs.model_config import is_deepseek_dsa as is_deepseek_nsa  # sglang>=0.5.13
+    except ImportError:
+        from sglang.srt.configs.model_config import is_deepseek_nsa  # sglang 0.5.12
 
     attn.use_nsa = is_deepseek_nsa(config)
     attn.use_deep_gemm_bmm = False

@@ -132,7 +132,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.12"
+ARG SGLANG_REF="v0.5.13.post1"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -230,6 +230,12 @@ RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && 
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton
+
+RUN echo "========== [SGLANG-ATOM 4.5/6] Pin hub/transformers for sglang 0.5.13 ==========" && \
+    "${VENV_PYTHON}" -m pip install --no-deps \
+      "huggingface_hub==1.20.1" \
+      "transformers==5.8.1" && \
+    "${VENV_PYTHON}" -c "import huggingface_hub, transformers; print('hub', huggingface_hub.__version__, '| transformers', transformers.__version__)"
 
 RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
