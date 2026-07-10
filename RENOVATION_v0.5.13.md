@@ -56,22 +56,20 @@ docker build -f docker/Dockerfile --target atom_sglang \
   -t atom-sglang:v0.5.13.post1 .
 ```
 
+## Self-check (inside the built container)
+```bash
+bash scripts/check_sglang_compat.sh   # AST-based; prints only UNGUARDED breaks
+```
+
 ## Remaining work — needs the container + GPU (import fixes != runtime correctness)
-The 2 fixes above make ATOM's plugin *import* on 0.5.13.post1. Runtime still
-needs validation because the NSA->DSA rework changed more than names:
-1. `mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None)` vs the old
-   `nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None)` — signature is
-   compatible for the single positional call ATOM makes (`deepseek_mla_attention.py:185`),
-   but confirm behaviour (single-node TP8 with no context-parallel -> returns False).
-2. ATOM's `deepseek_mla_forward.py` / `deepseek_mla_attention.py` reimplement the
-   MLA/indexer path against 0.5.12 internals; diff 0.5.12 `nsa_indexer.py` vs
-   0.5.13 `dsa/dsa_indexer.py` for changed method signatures ATOM calls into.
-3. Run the smoke test: launch GLM-5.2 NATIVE first (no ATOM) to confirm kernels,
-   then with `SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models`.
-4. If any further `ImportError`/`AttributeError` appears, extend the same
-   try/except pattern (grep `from sglang` in `atom/plugin/sglang/`).
+1. `mla_use_prefill_cp` vs old `nsa_use_prefill_cp` — positional call is compatible
+   (`deepseek_mla_attention.py`), confirm behaviour (single-node TP8, no CP -> False).
+2. Diff 0.5.12 `nsa_indexer.py` vs 0.5.13 `dsa/dsa_indexer.py` for changed method
+   signatures ATOM's MLA/indexer path calls into.
+3. Launch GLM-5.2 NATIVE first (no ATOM), then with
+   `SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models`.
+4. For any further ImportError/AttributeError, extend the same try/except pattern.
 
 ## Alternative: Direction A (no ATOM renovation)
 See `scripts/direction_a_backport_sgl_kernel.sh` — rebuild ONLY sgl-kernel from
-v0.5.13.post1 inside the 0.5.12 container, keep ATOM on 0.5.12. Smaller change;
-risk is 0.5.13 kernel ABI vs 0.5.12 python op-schema mismatch.
+v0.5.13.post1 inside the 0.5.12 container, keep ATOM on 0.5.12.
