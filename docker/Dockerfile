@@ -132,7 +132,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.12"
+ARG SGLANG_REF="v0.5.13.post1"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -230,6 +230,22 @@ RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && 
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton
+
+RUN echo "========== [SGLANG-ATOM 4.5/6] Pin hub/transformers for sglang 0.5.13 ==========" && \
+    "${VENV_PYTHON}" -m pip install --no-deps \
+      "huggingface_hub==1.20.1" \
+      "transformers==5.8.1" && \
+    "${VENV_PYTHON}" -c "import huggingface_hub, transformers; print('hub', huggingface_hub.__version__, '| transformers', transformers.__version__)"
+
+RUN echo "========== [SGLANG-ATOM 4.6/6] Install validated aiter wheel (AMD S3 nightly) ==========" && \
+    MAN="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json" && \
+    URL=$(curl -fsSL -H "Cache-Control: no-cache" "$MAN" | "${VENV_PYTHON}" -c "import sys,json;d=json.load(sys.stdin);w=d.get('wheels',{}).get('cp312',{});print(w.get('wheel_url') or d.get('wheel_url',''))") && \
+    ENC=$("${VENV_PYTHON}" -c "import sys,urllib.parse as u;p=u.urlsplit(sys.argv[1]);print(u.urlunsplit((p.scheme,p.netloc,'/'.join(u.quote(u.unquote(x),safe='') for x in p.path.split('/')),p.query,p.fragment)))" "$URL") && \
+    echo "aiter wheel: $ENC" && \
+    curl -fsSL "$ENC" -o /tmp/aiter.whl && \
+    "${VENV_PYTHON}" -m pip uninstall -y amd-aiter aiter || true && \
+    "${VENV_PYTHON}" -m pip install /tmp/aiter.whl && rm -f /tmp/aiter.whl && \
+    "${VENV_PYTHON}" -c "from aiter.dist.communication_op import tensor_model_parallel_fused_qknorm_allreduce_rope; from aiter.ops.shuffle import moe_shuffle_scale; print('aiter wheel OK')"
 
 RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \

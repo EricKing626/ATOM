@@ -5,15 +5,27 @@ from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
-from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
-from atom.models.minimax_m3 import (
-    MiniMaxM3SparseForCausalLM,
-    MiniMaxM3SparseForConditionalGeneration,
-)
-from atom.models.qwen3_5 import (
-    Qwen3_5MoeForConditionalGenerationTextOnly,
-    Qwen3_5ForConditionalGenerationTextOnly,
-)
+try:
+    from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
+except Exception as _e:
+    MiniMaxM2ForCausalLM = None
+    print(f'[atom] skip atom.models.minimax_m2: {_e}')
+try:
+    from atom.models.minimax_m3 import (
+        MiniMaxM3SparseForCausalLM,
+        MiniMaxM3SparseForConditionalGeneration,
+    )
+except Exception as _e:
+    MiniMaxM3SparseForCausalLM = MiniMaxM3SparseForConditionalGeneration = None
+    print(f'[atom] skip atom.models.minimax_m3: {_e}')
+try:
+    from atom.models.qwen3_5 import (
+        Qwen3_5MoeForConditionalGenerationTextOnly,
+        Qwen3_5ForConditionalGenerationTextOnly,
+    )
+except Exception as _e:
+    Qwen3_5MoeForConditionalGenerationTextOnly = Qwen3_5ForConditionalGenerationTextOnly = None
+    print(f'[atom] skip atom.models.qwen3_5: {_e}')
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
 
@@ -34,13 +46,29 @@ _ATOM_SUPPORTED_MODELS = {
 }
 
 if is_sglang():
-    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from atom.models.qwen3_next import Qwen3NextForCausalLM
-    from atom.models.qwen3_5 import (
-        Qwen3_5ForCausalLM,
-        Qwen3_5MoeForCausalLM,
-    )
-    from atom.models.kimi_k25 import KimiK25ForCausalLM
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+    except Exception as _e:
+        DeepseekV4ForCausalLM = None
+        print(f'[atom] skip atom.models.deepseek_v4: {_e}')
+    try:
+        from atom.models.qwen3_next import Qwen3NextForCausalLM
+    except Exception as _e:
+        Qwen3NextForCausalLM = None
+        print(f'[atom] skip atom.models.qwen3_next: {_e}')
+    try:
+        from atom.models.qwen3_5 import (
+            Qwen3_5ForCausalLM,
+            Qwen3_5MoeForCausalLM,
+        )
+    except Exception as _e:
+        Qwen3_5ForCausalLM = Qwen3_5MoeForCausalLM = None
+        print(f'[atom] skip atom.models.qwen3_5: {_e}')
+    try:
+        from atom.models.kimi_k25 import KimiK25ForCausalLM
+    except Exception as _e:
+        KimiK25ForCausalLM = None
+        print(f'[atom] skip atom.models.kimi_k25: {_e}')
 
     _ATOM_SUPPORTED_MODELS.update(
         {
@@ -58,6 +86,8 @@ if is_sglang():
         }
     )
 
+
+_ATOM_SUPPORTED_MODELS={k:v for k,v in _ATOM_SUPPORTED_MODELS.items() if v is not None}
 
 def _register_custom_attention_to_sglang() -> None:
     """Override sglang's built-in "aiter" attention backend with ATOM's implementation.
