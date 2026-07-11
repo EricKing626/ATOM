@@ -190,7 +190,10 @@ class SGLangDeepseekMLAAttention(nn.Module):
             mla_absorbed_bmm,
             mla_v_up_proj,
         )
-        from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+        try:
+            from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp  # sglang 0.5.12
+        except ImportError:
+            from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp as nsa_use_prefill_cp  # sglang>=0.5.13
 
         q = self._project_q(q_input, q_scale)
         k_nope = kv_c_normed.unsqueeze(1)
