@@ -207,7 +207,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
             attn.rotary_emb is not None
             and not attn.use_fused_qk_rope_concat_and_cache_mla
         ):
-            q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = attn.rotary_emb(positions, q_pe.contiguous(), k_pe.contiguous())  # ROCm: sgl_kernel rope needs contiguous q/k (mimic native sglang)
 
         if nsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
@@ -304,7 +304,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
         kv_a = kv_c_normed
         k_pe = k_pe.unsqueeze(1)
         if attn.rotary_emb is not None:
-            q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = attn.rotary_emb(positions, q_pe.contiguous(), k_pe.contiguous())  # ROCm: sgl_kernel rope needs contiguous q/k (mimic native sglang)
         q[..., attn.qk_nope_head_dim :] = q_pe
 
         _set_mla_kv_buffer_for_non_absorbed(attn, kv_a, k_pe, forward_batch)
