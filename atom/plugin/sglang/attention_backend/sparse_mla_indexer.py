@@ -28,6 +28,15 @@ import triton.language as tl
 from atom.utils.custom_register import direct_register_custom_op
 
 
+def _atom_kv_pool(forward_batch):
+    # sglang<=0.5.13 tag: ForwardBatch.token_to_kv_pool; newer builds: global get_token_to_kv_pool()
+    p = getattr(forward_batch, "token_to_kv_pool", None)
+    if p is not None:
+        return p
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+    return get_token_to_kv_pool()
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     req_id_ptr,
@@ -236,7 +245,7 @@ def forward_sparse_mla_for_sglang(
     """ATOM sparse MLA path for SGLang DeepSeek-V3.2."""
     if save_kv_cache and k is not None:
         assert v is not None
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        _atom_kv_pool(forward_batch).set_kv_buffer(
             layer, forward_batch.out_cache_loc, k, v
         )
 
@@ -244,7 +253,7 @@ def forward_sparse_mla_for_sglang(
     num_tokens = q.shape[0]
     topk_indices = topk_indices[:num_tokens]
     topk_tokens = topk_indices.shape[1]
-    page_size = int(getattr(forward_batch.token_to_kv_pool, "page_size", 1))
+    page_size = int(getattr(_atom_kv_pool(forward_batch), "page_size", 1))
 
     req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
         forward_batch, q.device
@@ -257,7 +266,7 @@ def forward_sparse_mla_for_sglang(
         (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
         dtype=output_dtype,
     )
-    k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+    k_buffer = _atom_kv_pool(forward_batch).get_key_buffer(layer.layer_id)
     q_descale = (
         (q_scale if q_scale is not None else getattr(layer, "q_scale", None))
         if q.dtype == dtypes.fp8
@@ -414,7 +423,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     if forward_batch is None or forward_batch.forward_mode.is_idle():
         return torch.zeros_like(weights, dtype=torch.float32)
 
-    token_to_kv_pool = forward_batch.token_to_kv_pool
+    token_to_kv_pool = _atom_kv_pool(forward_batch)
     if not hasattr(token_to_kv_pool, "get_index_k_with_scale_buffer"):
         raise RuntimeError(
             "[SGL+ATOM] DeepSeek-V3.2 sparse MLA requires SGLang NSA KV pool "
