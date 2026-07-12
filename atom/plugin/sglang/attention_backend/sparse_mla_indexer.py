@@ -37,6 +37,15 @@ def _atom_kv_pool(forward_batch):
     return get_token_to_kv_pool()
 
 
+def _atom_req_pool(forward_batch):
+    # sglang<=0.5.13 tag: ForwardBatch.req_to_token_pool; newer builds: global get_req_to_token_pool()
+    p = getattr(forward_batch, "req_to_token_pool", None)
+    if p is not None:
+        return p
+    from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+    return get_req_to_token_pool()
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     req_id_ptr,
@@ -169,7 +178,7 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
 
 def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     req_pool_indices = forward_batch.req_pool_indices
-    req_to_token = forward_batch.req_to_token_pool.req_to_token
+    req_to_token = _atom_req_pool(forward_batch).req_to_token
     token_table = req_to_token[req_pool_indices, :]
     if not forward_batch.forward_mode.is_decode_or_idle():
         token_table = token_table.clone()
