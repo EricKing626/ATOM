@@ -856,6 +856,22 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 
+# ATOM compat: sgl-dev's aiter build of tensor_model_parallel_fused_allreduce_rmsnorm_quant
+# lacks some kwargs (e.g. transpose_scale). Drop kwargs the installed aiter doesn't accept.
+import inspect as _atom_inspect
+try:
+    _atom_fused_arrq_orig = tensor_model_parallel_fused_allreduce_rmsnorm_quant
+    _atom_fused_arrq_params = _atom_inspect.signature(_atom_fused_arrq_orig).parameters
+    _atom_fused_arrq_varkw = any(p.kind == p.VAR_KEYWORD for p in _atom_fused_arrq_params.values())
+    def _atom_fused_arrq(*a, **k):
+        if not _atom_fused_arrq_varkw:
+            k = {kk: vv for kk, vv in k.items() if kk in _atom_fused_arrq_params}
+        return _atom_fused_arrq_orig(*a, **k)
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant = _atom_fused_arrq
+except (TypeError, ValueError, NameError):
+    pass
+
+
 @triton.jit
 def _fused_qk_norm_single_kernel(
     q_ptr,
