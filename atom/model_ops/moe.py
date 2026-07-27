@@ -41,6 +41,14 @@ from atom.model_ops.fused_moe.config import (
     mxfp4_w4a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
 )
+from atom.model_ops.fused_moe.expert_layout import (
+    count_local_base_experts,
+    determine_expert_map,
+    expert_region,
+    expert_shard_dim,
+    expert_shard_view,
+    physical_expert_id,
+)
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
     FusedMoEPrepareAndFinalize,
@@ -2344,52 +2352,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
 
-def determine_expert_map(
-    ep_size: int, ep_rank: int, global_num_experts: int
-) -> tuple[int, torch.Tensor | None]:
-    """
-    Calculates how many experts should be assigned to each rank for EP and
-    creates a mapping from global to local expert index. Experts are
-    distributed evenly across ranks. Any remaining are assigned to the
-    last rank.
-
-    Args:
-        ep_size (int): The size of the expert parallel group
-        global_num_experts (int): The total number of experts in the model.
-
-    Returns:
-        Tuple[int, Optional[torch.Tensor]]: A tuple containing:
-            - local_num_experts (int): The number of experts assigned
-                to the current rank.
-            - expert_map (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts,) mapping from global to local index.
-                Contains -1 for experts not assigned to the current rank.
-                Returns None if ep_size is 1.
-    """
-    assert ep_size > 0
-    if ep_size == 1:
-        return (global_num_experts, None)
-
-    local_num_experts = global_num_experts // ep_size
-
-    # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
-    # Create a expert map for the local experts
-    if ep_rank < (ep_size - 1):
-        # Each non-last rank gets local_num_experts experts.
-        expert_map[ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts] = (
-            torch.arange(0, local_num_experts, dtype=torch.int32)
-        )
-    else:
-        # All remaining experts are assigned to the last rank.
-        local_num_experts = global_num_experts - ep_rank * local_num_experts
-
-        expert_map[-local_num_experts:] = torch.arange(
-            0, local_num_experts, dtype=torch.int32
-        )
-    return (local_num_experts, expert_map)
-
-
 def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -3082,13 +3044,7 @@ class FusedMoE(torch.nn.Module):
         # for online local quantizaiton
         if load_full:
             expert_shard_size = expert_data.shape[shard_dim] // 2
-            if shard_id == "w1":
-                expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
-            else:
-                assert shard_id == "w3"
-                expert_data = expert_data.narrow(
-                    shard_dim, expert_shard_size, expert_shard_size
-                )
+            expert_data = expert_shard_view(expert_data, shard_id, shard_dim)
             load_size = loaded_weight.shape[shard_dim]
             if load_size != expert_shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
@@ -3104,16 +3060,9 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = loaded_weight.narrow(
             shard_dim, load_shard_size * tp_rank, load_shard_size
         )
-        # Narrow parameter and load.
-        # w1, gate_proj: Load into first logical weight of w13.
-        if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
-        # w3, up_proj: Load into second logical weight of w13.
-        else:
-            assert shard_id == "w3"
-            expert_data = expert_data.narrow(
-                shard_dim, expert_shard_size, expert_shard_size
-            )
+        # Narrow parameter and load: w1 (gate_proj) into the first logical
+        # weight of w13, w3 (up_proj) into the second.
+        expert_data = expert_shard_view(expert_data, shard_id, shard_dim)
         # When expert_data is padded beyond the actual weight size, narrow to
         # the loaded weight size so the copy shape matches.
         if load_shard_size != expert_shard_size:
@@ -3181,7 +3130,14 @@ class FusedMoE(torch.nn.Module):
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self.expert_map is None:
             return expert_id
-        return self.expert_map[expert_id].item()
+        return self.expert_map[
+            physical_expert_id(
+                expert_id,
+                self.global_num_experts,
+                self.num_redundant_experts,
+                self.num_fused_shared_experts,
+            )
+        ].item()
 
     def mxf4_merged_weight_loader(
         self,
@@ -3373,11 +3329,7 @@ class FusedMoE(torch.nn.Module):
         ):
             loaded_weight = loaded_weight.t().contiguous()
 
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
-        is_transposed = getattr(param, "is_transposed", False)
-        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if is_transposed:
-            shard_dim = int(not shard_dim)
+        shard_dim = expert_shard_dim(shard_id, getattr(param, "is_transposed", False))
 
         if len(loaded_weight.shape) == 3:
             return False
@@ -3410,26 +3362,79 @@ class FusedMoE(torch.nn.Module):
         ):
             w13_batchable.append(getattr(self, "w13_weight_scale", None))
             w2_batchable.append(getattr(self, "w2_weight_scale", None))
-        # Only local BASE (non-redundant) expert slots receive a checkpoint
-        # weight during loading; EPLB redundant physical slots are filled later
-        # by fill_redundant, so they never arrive here. Counting all local
-        # physical slots (local_num_experts) would over-estimate `expected` on
-        # ranks that own redundant slots -> the batched staging entry never
-        # reaches the flush threshold, so it is never flushed/freed (staging
-        # leaks for every layer -> OOM, and load never completes -> the rank
-        # misses the post-load all2all init collective -> hang). Count only the
-        # local slots inside the logical range (the base experts the checkpoint
-        # actually delivers).
-        if self.expert_map is not None:
-            num_logical = self.global_num_experts - self.num_redundant_experts
-            n_local_base = int((self.expert_map[:num_logical] != -1).sum().item())
-        else:
-            n_local_base = self.local_num_experts
+        # Counted over routed BASE slots only. EPLB redundant replicas are
+        # filled by fill_redundant after loading, and fused shared experts are
+        # delivered by the checkpoint separately and never staged
+        # (`is_batched_expert_slot`). Counting either would leave the entry
+        # short of its threshold forever: it is never flushed or freed, so
+        # staging leaks for every layer and the rank never finishes loading.
+        n_local_base = self.num_local_base_experts
         if any(param is p for p in w13_batchable if p is not None):
             return n_local_base * 2
         if any(param is p for p in w2_batchable if p is not None):
             return n_local_base
         return None
+
+    @property
+    def num_local_base_experts(self) -> int:
+        """Local slots holding a routed base expert, i.e. slots `[0, n)`."""
+        return count_local_base_experts(
+            expert_map=self.expert_map,
+            global_num_experts=self.global_num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+            local_num_experts=self.local_num_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+        )
+
+    def is_batched_expert_slot(self, local_expert_id: int) -> bool:
+        """Whether arrivals for this local slot should go through staging.
+
+        Only routed base experts benefit: they arrive one tensor per (expert,
+        shard) and coalescing them is the entire point. A fused shared expert
+        is three tensors per layer, and in checkpoints that store routed
+        experts as one stacked tensor it is the *only* thing that would be
+        staged -- leaving a parameter-sized buffer alive for a handful of rows.
+        """
+        return local_expert_id < self.num_local_base_experts
+
+    def flush_staged(
+        self,
+        param: torch.nn.Parameter,
+        staging: torch.Tensor,
+        filled: set[tuple[int, str]],
+    ) -> None:
+        """Write staged (slot, shard) regions of `staging` back into `param`.
+
+        Only the regions in `filled` are written. Other loader paths may own
+        the remaining slots of the same parameter -- a checkpoint that stores
+        routed experts as one stacked tensor loads them directly while the
+        shared expert comes through the per-expert path -- and a whole-buffer
+        copy would overwrite their work with zeros.
+        """
+        dst = (
+            param.data.view(torch.uint8)
+            if staging.dtype != param.data.dtype
+            else param.data
+        )
+        n_base = self.num_local_base_experts
+        if len(filled) == self.expected_batched_arrivals(param):
+            # Every base slot arrived: one large copy, which is the reason the
+            # staging path exists at all.
+            dst[:n_base].copy_(staging[:n_base])
+        else:
+            is_transposed = getattr(param, "is_transposed", False)
+            for local_expert_id, shard_id in sorted(filled):
+                expert_region(dst, local_expert_id, shard_id, is_transposed).copy_(
+                    expert_region(staging, local_expert_id, shard_id, is_transposed)
+                )
+        # EPLB redundant replicas belong to fill_redundant, which runs after
+        # process_weights_after_loading has already read every local slot.
+        # create_weights hands them out as torch.empty, so zero them here --
+        # the whole-buffer flush this replaced used to do it as a side effect.
+        for slot in range(
+            n_base, self.local_num_experts - self.num_fused_shared_experts
+        ):
+            dst[slot].zero_()
 
     def weight_loader(
         self,
@@ -3461,18 +3466,9 @@ class FusedMoE(torch.nn.Module):
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
             )
 
-        # Fetch the dim to shard the parameter/loaded weight
-        # based on the shard id. This will be whatever
-        # dimension intermediate_size_per_partition is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
-
-        # is_transposed: if the dim to shard the weight
-        # should be flipped. Required by GPTQ, compressed-tensors
-        # should be whatever dimension intermediate_size_per_partition is
-        is_transposed = getattr(param, "is_transposed", False)
-        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if is_transposed:
-            shard_dim = int(not shard_dim)
+        # Fetch the dim to shard the parameter/loaded weight based on the shard
+        # id; `is_transposed` (GPTQ, compressed-tensors) flips it.
+        shard_dim = expert_shard_dim(shard_id, getattr(param, "is_transposed", False))
 
         full_load = len(loaded_weight.shape) == 3
         if full_load:
