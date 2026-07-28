@@ -36,9 +36,6 @@ from aiter import (
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
-from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
-)
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -76,6 +73,9 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import (
@@ -2646,7 +2646,12 @@ class DeepseekV4Attention(nn.Module):
         return torch.einsum("sgd,grd->sgr", o, wo_a)
 
     def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
-        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
+        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped).
+
+        wo_b's RowParallelLinear TP all_reduce goes through the ATOM AR layer,
+        which routes it through the TBO-aware custom op on the pure-TP+TBO path
+        (overlaps the partner ubatch's compute) and a plain reduce otherwise.
+        """
         o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o.flatten(1))
 
@@ -3516,6 +3521,9 @@ class MoE(nn.Module):
                 shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
+            # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether
+            # to route through the TBO-aware custom op (pure TP+TBO) or a plain
+            # all_reduce (non-TBO / TBO+DP).
             routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
