@@ -106,7 +106,7 @@ on:
         default: ''
         type: string
       eval_concurrency:
-        description: 'Optional lm_eval concurrency override, e.g. 64 or 32,64 (no quotes)'
+        description: 'Optional accuracy result-concurrency override; SWE-bench agent workers come from models_atomesh.yaml'
         required: false
         default: ''
         type: string
@@ -373,7 +373,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    timeout-minutes: 420
+    timeout-minutes: ${{ matrix.run_eval && matrix.accuracy.task == 'swebench_lite' && 780 || 420 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
@@ -424,6 +424,7 @@ jobs:
               "osl": get("osl"),
               "concurrency": get("concurrency"),
               "run_eval": get("run_eval"),
+              "accuracy": get("accuracy"),
           }
 
           print("=== ATOMesh benchmark config summary ===")
