@@ -40,10 +40,13 @@ class KVCacheTensor:
     """
 
     layer_num: int
-    k_cache: torch.Tensor = torch.tensor([])
-    v_cache: torch.Tensor = torch.tensor([])
+    k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
+    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    index_cache: torch.Tensor | None = None
 
 
 @dataclass
