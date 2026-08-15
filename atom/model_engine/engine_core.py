@@ -18,6 +18,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
     envs,
     init_exit_handler,
@@ -93,8 +94,7 @@ class EngineCore:
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
-            config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
-            config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
+            self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -123,7 +123,10 @@ class EngineCore:
         # consumers can reference it before DecodeEngineCore creates the real one.
         self.scheduler = None
         if not config.disagg_is_decode:
-            self.scheduler = Scheduler(config)
+            self.scheduler = Scheduler(
+                config,
+                state_runtime=self.state_runtime,
+            )
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         if self.kv_transfer_enabled:
@@ -917,7 +920,9 @@ class DecodeEngineCore(EngineCore):
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(
-            config, disagg_cu_shm_name=config.disagg_cu_shm_name
+            config,
+            disagg_cu_shm_name=config.disagg_cu_shm_name,
+            state_runtime=self.state_runtime,
         )
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.
