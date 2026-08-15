@@ -31,6 +31,11 @@ from atom.utils.distributed.utils import (
 
 logger = logging.getLogger("atom")
 
+# How often each EngineCore publishes its metrics snapshot. Kept at the API
+# server's scrape interval: the exporter reads a cache, so this bounds how
+# stale a Prometheus sample can be.
+METRICS_PUSH_INTERVAL_S = 5.0
+
 
 class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
@@ -50,6 +55,13 @@ class EngineCore:
         )
         self.input_address = input_address
         self.output_address = output_address
+        # Control traffic arrives on its own socket so CoreManager can keep the
+        # request socket single-writer; see CoreManager._send_request.
+        self.control_address = config.parallel_config.control_address
+        assert self.control_address, (
+            "parallel_config.control_address is unset -- an EngineCore must be "
+            "launched through CoreManager, which allocates the control channel"
+        )
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
@@ -63,7 +75,9 @@ class EngineCore:
         # The READY signal (sent at the end of __init__) gates actual request
         # processing, so starting the input thread early is safe.
         self.input_thread = threading.Thread(
-            target=self.process_input_sockets, args=(self.input_address,), daemon=True
+            target=self.process_input_sockets,
+            args=(self.input_address, self.control_address),
+            daemon=True,
         )
         self.input_thread.start()
 
@@ -232,9 +246,14 @@ class EngineCore:
 
     def busy_loop(self):
         shutdown = False
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics()
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -368,26 +387,51 @@ class EngineCore:
             self.scheduler.extend(recv_reqs)
         return False
 
-    def process_input_sockets(self, input_address: str):
-        """Input socket IO thread."""
+    def process_input_sockets(self, input_address: str, control_address: str):
+        """Input IO thread, serving both the request and control sockets.
+
+        Two sockets, one thread: requests arrive on ``input_address`` and
+        control traffic (utility commands, abort, shutdown) on
+        ``control_address``. The split exists on the sending side -- it lets
+        CoreManager keep the request socket single-writer and therefore
+        lock-free -- and both feed the same dispatch below.
+        """
         with ExitStack() as stack, zmq.Context() as ctx:
             input_socket = stack.enter_context(
                 make_zmq_socket(ctx, input_address, zmq.DEALER, bind=False)
             )
+            control_socket = stack.enter_context(
+                make_zmq_socket(ctx, control_address, zmq.DEALER, bind=False)
+            )
             poller = zmq.Poller()
-            # Send initial message to input socket - this is required
-            # before the front-end ROUTER socket can send input messages
+            # Send initial message on each socket - this is required
+            # before the front-end ROUTER sockets can send messages
             # back to us.
             input_socket.send(b"")
+            control_socket.send(b"")
             poller.register(input_socket, zmq.POLLIN)
-            logger.debug(f"{self.label}: input socket connected")
+            poller.register(control_socket, zmq.POLLIN)
+            logger.debug(f"{self.label}: input and control sockets connected")
             alive = True
 
             while alive:
-                for input_socket, _ in poller.poll():
+                for sock, _ in poller.poll():
                     # (RequestType, RequestData)
-                    obj = input_socket.recv(copy=False)
-                    request_type, reqs = pickle.loads(obj)
+                    obj = sock.recv(copy=False)
+                    try:
+                        request_type, reqs = pickle.loads(obj)
+                    except Exception:
+                        # This thread is the only way requests reach the engine,
+                        # so letting it die strands every later request: the
+                        # busy loop keeps polling an empty input queue, the
+                        # workers idle, and clients wait forever with no error
+                        # on any log but this thread's own traceback. Drop the
+                        # frame loudly and keep serving.
+                        logger.exception(
+                            f"{self.label}: dropping undecodable input frame "
+                            f"({len(obj.bytes)} bytes)"
+                        )
+                        continue
                     if request_type == EngineCoreRequestType.ADD:
                         req_ids = [req.id for req in reqs]
                         logger.debug(
@@ -428,6 +472,11 @@ class EngineCore:
                     obj = pickle.dumps((EngineCoreRequestType.READY, None))
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "METRICS":
+                    obj = pickle.dumps((EngineCoreRequestType.METRICS, item[1]))
+                    socket.send(obj)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
@@ -508,9 +557,14 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics()
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
                     not self.scheduler.is_finished()
