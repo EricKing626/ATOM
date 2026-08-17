@@ -27,6 +27,10 @@ from atom.plugin.sglang.runtime import (
     get_model_arch_spec,
     plugin_runtime_scope,
 )
+from atom.plugin.sglang.tbo import (
+    SGLangPluginUBatchWrapper,
+    prepare_sglang_tbo_forward_inputs,
+)
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
@@ -93,6 +97,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
         self.capture_aux_hidden_states = False
+        self.atom_tbo_wrapper: SGLangPluginUBatchWrapper | None = None
+        self._tbo_fallback_reasons_logged: set[str] = set()
 
         with plugin_runtime_scope(framework="sglang"):
             from atom.config import get_current_atom_config
@@ -153,6 +159,67 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if self.model_arch_spec.install_adapters is not None:
             with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
                 self.model_arch_spec.install_adapters(self.model)
+
+        if self.atom_config.enable_tbo:
+            if self.model_arch in ("DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"):
+                self.atom_tbo_wrapper = SGLangPluginUBatchWrapper(self.model)
+            else:
+                logger.warning(
+                    "ATOM SGLang TBO is not yet adapted for architecture %s; "
+                    "using the normal SGLang forward path",
+                    self.model_arch,
+                )
+
+    def _log_tbo_fallback_once(self, reason: str) -> None:
+        if reason in self._tbo_fallback_reasons_logged:
+            return
+        self._tbo_fallback_reasons_logged.add(reason)
+        logger.info("ATOM SGLang TBO fallback: %s", reason)
+
+    def _try_forward_with_atom_tbo(
+        self,
+        *,
+        runtime: SGLangPluginRuntime,
+        metadata: SGLangForwardBatchMetadata,
+        model_inputs: dict[str, Any],
+        get_embedding: bool,
+        pp_proxy_tensors: PPProxyTensors | None,
+    ):
+        """Run eligible SGLang children through ATOM's two-worker executor."""
+
+        if self.atom_tbo_wrapper is None:
+            return None
+        if (
+            get_embedding
+            or pp_proxy_tensors is not None
+            or model_inputs.get("intermediate_tensors") is not None
+            or model_inputs.get("inputs_embeds") is not None
+        ):
+            self._log_tbo_fallback_once(
+                "embedding, PP proxy, intermediate tensors, or precomputed input "
+                "embeddings are not supported"
+            )
+            return None
+
+        tbo_inputs = prepare_sglang_tbo_forward_inputs(
+            runtime.forward_batch,
+            enable_expert_parallel=self.atom_config.enable_expert_parallel,
+        )
+        if tbo_inputs is None:
+            self._log_tbo_fallback_once(
+                "local adapter or cross-rank collective gate is not ready"
+            )
+            return None
+
+        from atom.utils.forward_context import get_forward_context
+
+        forward_context = get_forward_context()
+        forward_context.ubatch_slices = tbo_inputs.ubatch_slices
+        forward_context.ub_max_tokens_across_dp = tbo_inputs.ub_max_tokens_across_dp
+        return self.atom_tbo_wrapper.forward_with_sglang_children(
+            child_forward_batches=tbo_inputs.child_forward_batches,
+            save_kv_cache=metadata.save_kv_cache,
+        )
 
     def _filter_model_forward_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Drop SGLang wrapper kwargs that the ATOM model forward does not accept."""
@@ -348,9 +415,21 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                                 **self._filter_model_forward_kwargs(model_inputs)
                             )
                     elif self.model_arch_spec.uses_context_only_forward:
-                        hidden_states = self.model(
-                            **self._filter_model_forward_kwargs(model_inputs)
-                        )
+                        tbo_output = None
+                        if self.atom_config.enable_tbo:
+                            tbo_output = self._try_forward_with_atom_tbo(
+                                runtime=runtime,
+                                metadata=metadata,
+                                model_inputs=model_inputs,
+                                get_embedding=get_embedding,
+                                pp_proxy_tensors=pp_proxy_tensors,
+                            )
+                        if tbo_output is None:
+                            hidden_states = self.model(
+                                **self._filter_model_forward_kwargs(model_inputs)
+                            )
+                        else:
+                            hidden_states = tbo_output
                     else:
                         model_call_kwargs = dict(
                             model_inputs,
