@@ -8,15 +8,15 @@ To add a new model, append its architecture class name to _MODEL_NAMES.
 
 import inspect
 import logging
-from typing import Any, Iterable, Optional, Tuple, Union
+from collections.abc import Iterable
+from typing import Any
 
 import torch
-from torch import nn
-
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from torch import nn
 
 from atom.plugin.sglang.runtime import (
     MODEL_ARCH_SPECS,
@@ -72,7 +72,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -81,8 +81,15 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.unpadded_vocab_size = config.vocab_size
+        vocab_size = getattr(config, "vocab_size", None)
+        if vocab_size is None and hasattr(config, "text_config"):
+            vocab_size = getattr(config.text_config, "vocab_size", None)
+        if vocab_size is None:
+            raise AttributeError(f"{type(config).__name__} does not define vocab_size")
+        if not hasattr(config, "vocab_size"):
+            config.vocab_size = vocab_size
+        self.vocab_size = vocab_size
+        self.unpadded_vocab_size = vocab_size
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
         self.capture_aux_hidden_states = False
@@ -293,10 +300,12 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
         **model_kwargs: Any,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+    ) -> LogitsProcessorOutput | PPProxyTensors:
+        with plugin_runtime_scope(  # noqa: SIM117
+            framework="sglang", atom_config=self.atom_config
+        ):
             with SGLangPluginRuntime(
                 atom_config=self.atom_config,
                 forward_batch=forward_batch,
@@ -402,7 +411,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     )
                 return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM
         # uses its own weight loading pipeline (handling AITER-specific quant
         # formats, kv_b_proj splitting, etc.) that is incompatible with
