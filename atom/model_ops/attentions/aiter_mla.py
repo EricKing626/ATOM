@@ -905,11 +905,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        kv_cache = runner.kv_cache[layer_id].view(
-            runner.num_physical_kvcache_blocks * runner.physical_block_size,
-            1,
-            576,
-        )
+        num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
+        kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
             # Use aligned dimension to avoid memory copy in torch inductor
@@ -919,16 +916,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
-        index_cache = None
-        if runner.is_deepseek_v32 and hasattr(runner, "index_cache"):
-            index_cache = runner.index_cache[layer_id]
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,
             v_scale=None,
-            index_cache=index_cache,
+            index_cache=(
+                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
+            ),
         )
 
     def get_kv_transfer_tensors(self):
